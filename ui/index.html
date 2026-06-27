@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Memory</title>
+<style>
+  :root{
+    --bg:#0c0c11; --panel:#14141d; --panel2:#1b1b27; --line:#262633;
+    --gold:#e6c34d; --gold-dim:#b8932f; --txt:#ececf2; --muted:#8a8a9c; --danger:#e5616a;
+    --proj:#6ea8fe; --feedback:#f0a35e; --reference:#7bd88f; --user:#c78bf0; --note:#9aa0b4;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",Inter,sans-serif;background:var(--bg);color:var(--txt);overflow:hidden;font-size:13.5px}
+  ::-webkit-scrollbar{width:9px;height:9px}
+  ::-webkit-scrollbar-thumb{background:#2c2c3a;border-radius:6px}
+  ::-webkit-scrollbar-thumb:hover{background:#3a3a4d}
+
+  .app{display:grid;grid-template-rows:auto 1fr;height:100vh}
+
+  /* Header */
+  header{display:flex;align-items:center;gap:16px;padding:13px 18px;background:linear-gradient(180deg,#15151f,#101019);border-bottom:1px solid var(--line)}
+  .logo{display:flex;align-items:center;gap:9px;font-weight:700;font-size:15px;letter-spacing:.2px}
+  .logo .mark{font-size:19px;filter:drop-shadow(0 0 6px rgba(230,195,77,.4))}
+  .logo b{background:linear-gradient(90deg,var(--gold),#f5e08a);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+  .chips{display:flex;gap:8px;margin-left:6px}
+  .chip{background:var(--panel2);border:1px solid var(--line);border-radius:20px;padding:4px 11px;font-size:11.5px;color:var(--muted)}
+  .chip b{color:var(--gold);font-weight:600}
+  .spacer{flex:1}
+  select,.btn{font-family:inherit;font-size:12.5px;color:var(--txt);background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:7px 11px;cursor:pointer;transition:.15s}
+  select:hover,.btn:hover{border-color:var(--gold-dim);background:#22222f}
+  .btn.ghost{background:transparent}
+  .btn.gold{background:linear-gradient(180deg,var(--gold),var(--gold-dim));color:#1a1500;font-weight:700;border:none}
+  .btn.gold:hover{filter:brightness(1.08)}
+
+  /* Body */
+  .body{display:grid;grid-template-columns:340px 1fr;min-height:0}
+  .side{border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0;background:#0f0f17}
+  .side .top{padding:12px;display:flex;flex-direction:column;gap:9px}
+  .search{display:flex;align-items:center;gap:8px;background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:8px 11px}
+  .search input{flex:1;background:none;border:none;outline:none;color:var(--txt);font-size:13px}
+  .search .ic{color:var(--muted)}
+  .list{overflow-y:auto;flex:1;padding:4px 8px 14px}
+  .card{padding:10px 11px;border-radius:9px;border:1px solid transparent;cursor:pointer;margin-bottom:5px;transition:.12s}
+  .card:hover{background:var(--panel)}
+  .card.active{background:var(--panel2);border-color:var(--gold-dim)}
+  .card .t{font-weight:600;font-size:13px;line-height:1.25;margin-bottom:3px;display:flex;align-items:center;gap:7px}
+  .card .d{color:var(--muted);font-size:11.5px;line-height:1.35;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  .badge{font-size:9.5px;text-transform:uppercase;letter-spacing:.5px;font-weight:700;padding:2px 6px;border-radius:5px;flex:none}
+  .badge.project{background:rgba(110,168,254,.16);color:var(--proj)}
+  .badge.feedback{background:rgba(240,163,94,.16);color:var(--feedback)}
+  .badge.reference{background:rgba(123,216,143,.16);color:var(--reference)}
+  .badge.user{background:rgba(199,139,240,.16);color:var(--user)}
+  .badge.note{background:rgba(154,160,180,.16);color:var(--note)}
+
+  /* Detail */
+  .main{min-height:0;overflow-y:auto;padding:26px 30px}
+  .empty{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;color:var(--muted);gap:12px;text-align:center}
+  .empty .big{font-size:46px;opacity:.5}
+  .detail h1{font-size:21px;font-weight:700;line-height:1.25;margin-bottom:9px}
+  .meta{display:flex;align-items:center;gap:10px;flex-wrap:wrap;color:var(--muted);font-size:11.5px;margin-bottom:18px}
+  .meta a{color:var(--proj);text-decoration:none;cursor:pointer}
+  .meta a:hover{text-decoration:underline}
+  .doc{line-height:1.62;font-size:13.8px;color:#dcdce6;max-width:780px}
+  .doc h1,.doc h2,.doc h3{color:#fff;margin:18px 0 8px;line-height:1.3}
+  .doc h1{font-size:18px} .doc h2{font-size:16px} .doc h3{font-size:14.5px}
+  .doc p{margin:9px 0} .doc ul{margin:8px 0 8px 20px} .doc li{margin:3px 0}
+  .doc code{background:#22222f;padding:1.5px 6px;border-radius:5px;font-family:"SF Mono",ui-monospace,monospace;font-size:12px;color:var(--gold)}
+  .doc strong{color:#fff} .doc a{color:var(--proj)}
+  .doc .wl{color:var(--gold);background:rgba(230,195,77,.1);padding:1px 5px;border-radius:4px;cursor:pointer}
+  textarea.edit{width:100%;max-width:820px;min-height:55vh;background:var(--panel);border:1px solid var(--line);border-radius:10px;color:var(--txt);font-family:"SF Mono",ui-monospace,monospace;font-size:12.5px;line-height:1.6;padding:14px;outline:none;resize:vertical}
+  .actions{display:flex;gap:9px;margin:16px 0}
+
+  /* Modal + toast */
+  .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.62);display:none;align-items:center;justify-content:center;z-index:50}
+  .modal-bg.show{display:flex}
+  .modal{width:560px;max-width:92vw;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px;box-shadow:0 24px 70px rgba(0,0,0,.5)}
+  .modal h2{font-size:16px;margin-bottom:16px}
+  .modal label{display:block;font-size:11.5px;color:var(--muted);margin:11px 0 5px;text-transform:uppercase;letter-spacing:.4px}
+  .modal input,.modal select,.modal textarea{width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;color:var(--txt);font-family:inherit;font-size:13px;padding:9px 11px;outline:none}
+  .modal textarea{min-height:120px;font-family:"SF Mono",ui-monospace,monospace;font-size:12px;resize:vertical}
+  .modal .row{display:flex;gap:12px} .modal .row>*{flex:1}
+  .modal .foot{display:flex;justify-content:flex-end;gap:9px;margin-top:18px}
+  #toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%) translateY(20px);background:#1c1c28;border:1px solid var(--gold-dim);color:var(--txt);padding:11px 18px;border-radius:10px;font-size:12.5px;opacity:0;transition:.25s;z-index:60;max-width:70vw;white-space:pre-wrap}
+  #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="logo"><span class="mark">🧠</span> <span>Claude <b>Memory</b></span></div>
+    <div class="chips">
+      <span class="chip"><b id="st-count">—</b> souvenirs</span>
+      <span class="chip"><b id="st-size">—</b></span>
+    </div>
+    <div class="spacer"></div>
+    <button class="btn ghost" onclick="protectFocus()" title="Cache les navigateurs d'agents (anti-vol-de-focus)">🛡️ Focus</button>
+    <button class="btn ghost" onclick="browserStatus()" title="État du contrôleur navigateur headless">🕹️ Browser</button>
+    <select id="proj" onchange="switchDir(this.value)" title="Projet / dossier mémoire"></select>
+  </header>
+
+  <div class="body">
+    <aside class="side">
+      <div class="top">
+        <button class="btn gold" onclick="openNew()">＋ Nouveau souvenir</button>
+        <div class="search"><span class="ic">🔎</span><input id="q" placeholder="Chercher dans la mémoire…" oninput="onSearch()"></div>
+      </div>
+      <div class="list" id="list"></div>
+    </aside>
+
+    <main class="main" id="main">
+      <div class="empty">
+        <div class="big">🧠</div>
+        <div>Sélectionne un souvenir, ou crée-en un.<br>La mémoire permanente de Claude, à portée de clic.</div>
+      </div>
+    </main>
+  </div>
+</div>
+
+<!-- Modal nouveau -->
+<div class="modal-bg" id="modal">
+  <div class="modal">
+    <h2>＋ Nouveau souvenir</h2>
+    <label>Titre</label>
+    <input id="m-name" placeholder="Ex : Préférence de déploiement Vercel">
+    <div class="row">
+      <div><label>Type</label>
+        <select id="m-type">
+          <option value="reference">reference</option>
+          <option value="project">project</option>
+          <option value="feedback">feedback</option>
+          <option value="user">user</option>
+          <option value="note">note</option>
+        </select></div>
+      <div><label>Description (1 ligne, sert au rappel)</label>
+        <input id="m-desc" placeholder="Résumé court"></div>
+    </div>
+    <label>Contenu</label>
+    <textarea id="m-body" placeholder="Le fait à mémoriser…"></textarea>
+    <div class="foot">
+      <button class="btn ghost" onclick="closeNew()">Annuler</button>
+      <button class="btn gold" onclick="saveNew()">Enregistrer</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+let MEM = [], CUR = null, EDIT = false;
+const api = () => window.pywebview.api;
+const esc = s => (s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+
+function toast(msg){const t=document.getElementById("toast");t.textContent=msg;t.classList.add("show");clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove("show"),3800);}
+
+function mini_md(src){
+  let h = esc(src);
+  h = h.replace(/```([\s\S]*?)```/g,(m,c)=>`<pre style="background:#1b1b27;padding:11px;border-radius:8px;overflow:auto;font-size:12px">${c}</pre>`);
+  h = h.replace(/^### (.*)$/gm,"<h3>$1</h3>").replace(/^## (.*)$/gm,"<h2>$1</h2>").replace(/^# (.*)$/gm,"<h1>$1</h1>");
+  h = h.replace(/\*\*([^*]+)\*\*/g,"<strong>$1</strong>");
+  h = h.replace(/`([^`]+)`/g,"<code>$1</code>");
+  h = h.replace(/\[\[([^\]]+)\]\]/g,'<span class="wl" onclick="jump(\'$1\')">$1</span>');
+  h = h.replace(/\[([^\]]+)\]\(([^)]+)\)/g,'<a>$1</a>');
+  h = h.replace(/^\s*[-*] (.*)$/gm,"<li>$1</li>").replace(/(<li>[\s\S]*?<\/li>)/g,"<ul>$1</ul>");
+  h = h.split(/\n{2,}/).map(b=>/^<(h\d|ul|pre)/.test(b.trim())?b:`<p>${b.replace(/\n/g,"<br>")}</p>`).join("");
+  return h;
+}
+
+async function boot(){
+  const d = await api().dirs();
+  const sel = document.getElementById("proj"); sel.innerHTML="";
+  d.dirs.forEach(dir=>{const o=document.createElement("option");o.value=dir;o.textContent=dir.split("/projects/")[1]?.split("/")[0]||dir.split("/").slice(-2).join("/");if(dir===d.current)o.selected=true;sel.appendChild(o);});
+  await refresh();
+}
+async function refresh(){
+  const s = await api().stats();
+  document.getElementById("st-count").textContent = s.count;
+  document.getElementById("st-size").textContent = s.total_human;
+  MEM = await api().list(); render(MEM);
+}
+function render(items){
+  const L=document.getElementById("list");
+  if(!items.length){L.innerHTML=`<div style="padding:18px;color:var(--muted);font-size:12px">Aucun souvenir.</div>`;return;}
+  L.innerHTML = items.map(m=>`<div class="card ${CUR&&CUR.path===m.path?'active':''}" onclick='openMem(${JSON.stringify(m.path)})'>
+     <div class="t"><span class="badge ${m.type}">${m.type}</span> ${esc(m.title)}</div>
+     <div class="d">${esc(m.description||"—")}</div></div>`).join("");
+}
+let _t;
+function onSearch(){clearTimeout(_t);_t=setTimeout(async()=>{const q=document.getElementById("q").value;const r=q.trim()?await api().search(q):await api().list();render(r);},180);}
+
+async function openMem(path){
+  const m = await api().read(path); CUR=m; EDIT=false; render(MEM.length?MEM:[]);
+  document.querySelectorAll(".card").forEach(c=>c.classList.remove("active"));
+  view(m);
+}
+function view(m){
+  const dt = new Date(m.mtime*1000).toLocaleString("fr-FR",{day:"2-digit",month:"short",year:"numeric",hour:"2-digit",minute:"2-digit"});
+  document.getElementById("main").innerHTML = `<div class="detail">
+    <h1>${esc(m.title)}</h1>
+    <div class="meta"><span class="badge ${m.type}">${m.type}</span><span>${esc(m.file)}</span>·<span>${(m.size/1024).toFixed(1)} Ko</span>·<span>${dt}</span>·<a onclick='reveal(${JSON.stringify(m.path)})'>Révéler dans le Finder</a></div>
+    <div class="actions">
+      <button class="btn" onclick="toggleEdit()">✏️ Éditer</button>
+      <button class="btn ghost" style="color:var(--danger)" onclick='delMem(${JSON.stringify(m.path)})'>🗑️ Supprimer</button>
+    </div>
+    <div class="doc" id="doc">${mini_md(m.body)}</div></div>`;
+}
+function toggleEdit(){
+  if(!CUR) return; EDIT=!EDIT;
+  if(EDIT){
+    const raw = `---\nname: ${CUR.name}\ndescription: ${CUR.description}\nmetadata:\n  type: ${CUR.type}\n---\n\n${CUR.body}`;
+    document.getElementById("doc").outerHTML = `<textarea class="edit" id="ed">${esc(raw)}</textarea>
+      <div class="actions"><button class="btn gold" onclick="saveEdit()">💾 Enregistrer</button><button class="btn ghost" onclick="view(CUR)">Annuler</button></div>`;
+  }
+}
+async function saveEdit(){
+  const content=document.getElementById("ed").value;
+  const r=await api().update(CUR.path,content);
+  if(r.ok){CUR=r.memory;toast("Souvenir enregistré ✓");view(CUR);refresh();}else toast("Erreur : "+r.error);
+}
+async function delMem(path){
+  if(!confirm("Supprimer ce souvenir définitivement ?"))return;
+  const r=await api().delete(path);
+  if(r.ok!==false){toast("Supprimé");CUR=null;document.getElementById("main").innerHTML=`<div class="empty"><div class="big">🧠</div><div>Souvenir supprimé.</div></div>`;refresh();}
+  else toast("Erreur : "+r.error);
+}
+async function reveal(p){await api().reveal(p);}
+function jump(name){document.getElementById("q").value=name;onSearch();}
+
+function openNew(){document.getElementById("modal").classList.add("show");document.getElementById("m-name").focus();}
+function closeNew(){document.getElementById("modal").classList.remove("show");["m-name","m-desc","m-body"].forEach(i=>document.getElementById(i).value="");}
+async function saveNew(){
+  const name=document.getElementById("m-name").value.trim();
+  if(!name){toast("Donne un titre");return;}
+  const r=await api().add(name,document.getElementById("m-desc").value,document.getElementById("m-type").value,document.getElementById("m-body").value,true);
+  if(r.ok){toast("Souvenir créé ✓");closeNew();await refresh();openMem(r.memory.path);}else toast("Erreur : "+r.error);
+}
+async function switchDir(d){await api().set_dir(d);CUR=null;document.getElementById("main").innerHTML=`<div class="empty"><div class="big">🧠</div><div>Projet changé.</div></div>`;refresh();}
+async function protectFocus(){const r=await api().protect_focus();toast(r.ok?("🛡️ Focus protégé\n"+(r.out||"")):("Erreur : "+r.error));}
+async function browserStatus(){const r=await api().browser_status();toast(r.ok?("🕹️ "+r.out):("Browser : "+r.error));}
+
+window.addEventListener("pywebviewready", boot);
+document.addEventListener("keydown",e=>{if(e.key==="Escape")closeNew();if((e.metaKey||e.ctrlKey)&&e.key==="n"){e.preventDefault();openNew();}});
+</script>
+</body>
+</html>

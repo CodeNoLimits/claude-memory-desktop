@@ -1,0 +1,6 @@
+# venv (recreate with: python3 -m venv --system-site-packages .venv && .venv/bin/pip install -r requirements.txt)
+.venv/
+__pycache__/
+*.pyc
+launch.log
+.DS_Store

@@ -1,0 +1,6 @@
+# Claude Memory — desktop app deps. Create the venv with --system-site-packages to reuse system pyobjc.
+#   python3 -m venv --system-site-packages .venv
+#   .venv/bin/pip install -r requirements.txt
+pywebview>=5.0
+pyobjc-framework-WebKit>=10.0
+# claude_memory_core.py itself has ZERO external dependencies (stdlib only).

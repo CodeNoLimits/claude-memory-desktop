@@ -1,0 +1,931 @@
+#!/usr/bin/env python3
+"""
+nova-browse — Contrôleur de navigateur HEADLESS universel pour TOUS les terminaux DreamNova.
+============================================================================================
+Donne à n'importe quel agent (Claude Code, Grok, Antigravity, shell) la capacité de
+"voir et piloter le navigateur comme Claude-browser" — mais 100% caché (anti-vol-de-focus).
+
+Pilote Chrome Beta authentifié (profil ~/.chrome-beta-cdp-profile, sessions de David :
+Google/Gemini/YouTube/Grok/Notion/Shopify…) via le **CDP brut (WebSocket)** — indépendant
+de la version de Chrome (Playwright casse parfois sur Chrome trop récent ; le CDP brut, non).
+
+Boucle type Claude-browser :  VOIR (read/snapshot/see) → AGIR (click/type/fill) → OBSERVER.
+
+RÈGLES D'OR appliquées par construction (jamais à oublier) :
+  • JAMAIS launch()/launch_persistent_context()/nouveau profil/nouvelle fenêtre. UNIQUEMENT CDP.
+  • Chrome Beta = agent → TOUJOURS re-caché après chaque action. Chrome Canary = David → jamais touché.
+  • Réutilise les onglets EXISTANTS (WhatsApp/LinkedIn existent déjà) ; nouvel onglet = nouveau site seulement.
+  • 127.0.0.1 (PAS localhost : IPv6 bloque sur macOS).
+  • 2 échecs sur la même cible → STOP (le code te renvoie {ok:false,hint} ; l'agent écrit DAVID_ACTION_REQUIRED).
+
+USAGE (sortie JSON par défaut ; ajoute --text pour du lisible) :
+  nova-browse status
+  nova-browse tabs
+  nova-browse goto https://news.ycombinator.com           # nouvel onglet
+  nova-browse goto https://web.whatsapp.com --reuse        # réutilise l'onglet existant (RÈGLE WA/LI)
+  nova-browse read [--links] [--max 4000]                  # texte lisible de la page courante
+  nova-browse snapshot                                     # éléments interactifs numérotés [n] (clic par ref)
+  nova-browse click --ref 12                               # clic sur l'élément [12] du dernier snapshot
+  nova-browse click --text "Se connecter"                  # clic par texte (technique SPA canonique)
+  nova-browse click --selector "button.primary"
+  nova-browse type "bonjour" --selector "textarea"         # vraies frappes clavier
+  nova-browse fill --selector "#email" "a@b.com"           # set value + dispatch input (React-safe)
+  nova-browse key Enter
+  nova-browse eval "document.title"
+  nova-browse screenshot /tmp/page.png
+  nova-browse see --ask "Le paiement a-t-il réussi ?"      # Gemini-vision décrit/répond (SPA/WebGL)
+  nova-browse act "clique sur le bouton Generate"          # Gemini-vision → coords pixel → clic (Flow/Stitch)
+  nova-browse wait --text "Bienvenue" --ms 15000
+  nova-browse find vercel.com                              # suis-je authentifié sur ce domaine ?
+  nova-browse close --tab <id>                             # ferme un onglet que TU as ouvert (jamais WA/LI)
+
+L'onglet "courant" est mémorisé entre les appels (/tmp/nova-browse/current_tab) : goto/snapshot/tabs --select
+le fixent, les autres verbes l'utilisent par défaut. Force-le avec --tab <id> n'importe quand.
+"""
+import argparse
+import base64
+import glob
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+CDP = "http://127.0.0.1:9222"
+STATE_DIR = "/tmp/nova-browse"
+CURRENT_TAB = os.path.join(STATE_DIR, "current_tab")
+FAIL_LOG = os.path.join(STATE_DIR, "fails.json")
+PROFILE = os.path.expanduser("~/.chrome-beta-cdp-profile")
+os.makedirs(STATE_DIR, exist_ok=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CDP HTTP plumbing
+# ─────────────────────────────────────────────────────────────────────────────
+def _http(path, method="GET", timeout=10):
+    req = urllib.request.Request(CDP + path, method=method)
+    return json.loads(urllib.request.urlopen(req, timeout=timeout).read())
+
+
+def cdp_alive():
+    try:
+        return _http("/json/version", timeout=4).get("Browser")
+    except Exception:
+        return None
+
+
+def hide():
+    """Re-cache Chrome Beta UNIQUEMENT (jamais Chrome ni Canary). Silencieux."""
+    subprocess.run(
+        ["osascript", "-e",
+         'try\ntell application "System Events" to set visible of process "Google Chrome Beta" to false\nend try'],
+        capture_output=True,
+    )
+
+
+def ensure_chrome():
+    """Lance Chrome Beta caché s'il est down. `open -g -j` OBLIGATOIRE (jamais Popen du binaire :
+    auto-activation = vol de focus pendant que David tape). Anti-focus garanti."""
+    ver = cdp_alive()
+    if ver:
+        return ver
+    subprocess.run(
+        ["open", "-g", "-j", "-a", "Google Chrome Beta", "--args",
+         "--remote-debugging-port=9222", "--remote-allow-origins=*",
+         "--window-position=-9999,-9999", "--window-size=1,1",
+         "--no-first-run", "--no-default-browser-check",
+         "--disable-infobars", "--disable-session-crashed-bubble",
+         "--user-data-dir=" + PROFILE],
+        capture_output=True,
+    )
+    for _ in range(20):
+        time.sleep(0.6)
+        ver = cdp_alive()
+        if ver:
+            hide()
+            return ver
+    return None
+
+
+def list_pages():
+    try:
+        return [t for t in _http("/json") if t.get("type") == "page"]
+    except Exception:
+        return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CDP WebSocket — client pur stdlib (ZÉRO dépendance → marche sur TOUT python3 ≥ 3.6, tout terminal).
+# Voie rapide : websocket-client si installé. Sinon, fallback _WS (stdlib pur, ci-dessous).
+# ─────────────────────────────────────────────────────────────────────────────
+class _WS:
+    """Client WebSocket minimal (RFC 6455) sur socket stdlib — ws:// localhost, pas de TLS.
+    Implémente l'interface utilisée par Tab : send(str) / recv()->str / settimeout(f) / close()."""
+    def __init__(self, ws_url, timeout=45):
+        u = urllib.parse.urlparse(ws_url)
+        host, port = u.hostname or "127.0.0.1", u.port or 9222
+        path = (u.path or "/") + (("?" + u.query) if u.query else "")
+        self.sock = socket.create_connection((host, port), timeout=timeout)
+        key = base64.b64encode(os.urandom(16)).decode()
+        req = (f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+               "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+               f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
+        self.sock.sendall(req.encode())
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("handshake WS échoué")
+            resp += chunk
+        if b" 101 " not in resp.split(b"\r\n", 1)[0]:
+            raise ConnectionError("WS upgrade refusé: " + resp.split(b"\r\n", 1)[0].decode("latin1"))
+        self._buf = resp.split(b"\r\n\r\n", 1)[1]  # octets reçus après le handshake
+
+    def settimeout(self, t):
+        self.sock.settimeout(t)
+
+    def _read_exact(self, n):
+        while len(self._buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("WS connexion fermée")
+            self._buf += chunk
+        out, self._buf = self._buf[:n], self._buf[n:]
+        return out
+
+    def recv(self):
+        """Renvoie UN message texte complet (réassemble les continuations, gère ping/close)."""
+        data = b""
+        while True:
+            b0 = self._read_exact(1)[0]
+            fin, opcode = b0 & 0x80, b0 & 0x0F
+            b1 = self._read_exact(1)[0]
+            masked, length = b1 & 0x80, b1 & 0x7F
+            if length == 126:
+                length = int.from_bytes(self._read_exact(2), "big")
+            elif length == 127:
+                length = int.from_bytes(self._read_exact(8), "big")
+            mask = self._read_exact(4) if masked else b""
+            payload = self._read_exact(length)
+            if masked:
+                payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            if opcode == 0x8:        # close
+                raise ConnectionError("WS fermé par le serveur")
+            if opcode == 0x9:        # ping → pong
+                self._send_frame(payload, opcode=0xA)
+                continue
+            if opcode == 0xA:        # pong → ignore
+                continue
+            data += payload
+            if fin:
+                return data.decode("utf-8", "replace")
+
+    def _send_frame(self, data, opcode=0x1):
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        n = len(data)
+        header = bytes([0x80 | opcode])
+        if n < 126:
+            header += bytes([0x80 | n])
+        elif n < 65536:
+            header += bytes([0x80 | 126]) + n.to_bytes(2, "big")
+        else:
+            header += bytes([0x80 | 127]) + n.to_bytes(8, "big")
+        mask = os.urandom(4)
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        self.sock.sendall(header + mask + masked)
+
+    def send(self, data):
+        self._send_frame(data, opcode=0x1)
+
+    def close(self):
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+def _connect_ws(ws_url):
+    try:
+        import websocket  # websocket-client : voie rapide si installée
+        return websocket.create_connection(ws_url, timeout=45, max_size=None)
+    except ImportError:
+        return _WS(ws_url, timeout=45)
+
+
+class Tab:
+    def __init__(self, ws_url):
+        self.ws = _connect_ws(ws_url)
+        self._id = 0
+        self.cmd("Page.enable")
+        self.cmd("Runtime.enable")
+        self.cmd("DOM.enable")
+
+    def cmd(self, method, params=None, timeout=60):
+        self._id += 1
+        mid = self._id
+        self.ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
+        self.ws.settimeout(timeout)
+        while True:
+            msg = json.loads(self.ws.recv())
+            if msg.get("id") == mid:
+                if "error" in msg:
+                    raise RuntimeError(f"{method}: {msg['error'].get('message', msg['error'])}")
+                return msg.get("result", {})
+
+    def navigate(self, url, wait=3.5):
+        self.cmd("Page.navigate", {"url": url})
+        time.sleep(wait)
+
+    def eval(self, expr, await_promise=True, timeout=60):
+        r = self.cmd("Runtime.evaluate", {
+            "expression": f"(()=>{{ try{{ return ({expr}) }}catch(e){{ return 'NBERR:'+e.message }} }})()",
+            "returnByValue": True, "awaitPromise": await_promise,
+        }, timeout=timeout)
+        return r.get("result", {}).get("value")
+
+    def type_text(self, text, delay=0.012):
+        for ch in text:
+            self.cmd("Input.dispatchKeyEvent", {"type": "keyDown", "text": ch})
+            self.cmd("Input.dispatchKeyEvent", {"type": "keyUp", "text": ch})
+            if delay:
+                time.sleep(delay)
+
+    def press_key(self, key, code, vk, text=None):
+        down = {"type": "keyDown", "key": key, "code": code, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk}
+        if text:
+            down["text"] = text
+        self.cmd("Input.dispatchKeyEvent", down)
+        self.cmd("Input.dispatchKeyEvent", {"type": "keyUp", "key": key, "code": code,
+                                            "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk})
+
+    def click_xy(self, x, y):
+        for t in ("mousePressed", "mouseReleased"):
+            self.cmd("Input.dispatchMouseEvent",
+                     {"type": t, "x": x, "y": y, "button": "left", "clickCount": 1})
+
+    def screenshot(self, path):
+        r = self.cmd("Page.captureScreenshot", {"format": "png", "captureBeyondViewport": False})
+        with open(path, "wb") as f:
+            f.write(base64.b64decode(r["data"]))
+        return path
+
+    def set_file_input(self, file_paths, selector="input[type=file]"):
+        files = [os.path.abspath(p) for p in (file_paths if isinstance(file_paths, (list, tuple)) else [file_paths])]
+        doc = self.cmd("DOM.getDocument", {"depth": 0})
+        root = doc["root"]["nodeId"]
+        node = self.cmd("DOM.querySelector", {"nodeId": root, "selector": selector})
+        nid = node.get("nodeId", 0)
+        if not nid:
+            return False
+        self.cmd("DOM.setFileInputFiles", {"files": files, "nodeId": nid})
+        return True
+
+    def close_ws(self):
+        try:
+            self.ws.close()
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tab selection / "current tab" state
+# ─────────────────────────────────────────────────────────────────────────────
+def _read_current():
+    try:
+        with open(CURRENT_TAB) as f:
+            return f.read().strip()
+    except Exception:
+        return None
+
+
+def _write_current(tab_id):
+    try:
+        with open(CURRENT_TAB, "w") as f:
+            f.write(tab_id or "")
+    except Exception:
+        pass
+
+
+def resolve_target(tab_id=None, host=None, want_new=False, url=None):
+    """Retourne (page_dict, created:bool). Honore la RÈGLE NUCLÉAIRE :
+       - tab_id explicite → cet onglet.
+       - host (reuse) → onglet existant dont l'URL contient le host (NE crée PAS pour WA/LI).
+       - want_new → /json/new (nouveau site).
+       - sinon → onglet courant mémorisé, sinon 1er onglet."""
+    pages = list_pages()
+    if tab_id:
+        for p in pages:
+            if p.get("id") == tab_id:
+                return p, False
+        raise RuntimeError(f"onglet {tab_id} introuvable")
+    if host:
+        for p in pages:
+            if host.lower() in (p.get("url") or "").lower():
+                return p, False
+        # pas trouvé : pour WA/LI on NE crée pas — mais si une URL est fournie on ouvre (nouveau site explicite)
+        if not want_new and not url:
+            raise RuntimeError(f"aucun onglet contenant '{host}' (règle nucléaire : pas de création auto)")
+    if want_new or url:
+        info = _http("/json/new?url=" + urllib.parse.quote(url or "about:blank", safe=""), method="PUT")
+        # /json/new renvoie le descripteur du nouvel onglet
+        return info, True
+    cur = _read_current()
+    if cur:
+        for p in pages:
+            if p.get("id") == cur:
+                return p, False
+    if pages:
+        return pages[0], False
+    # rien d'ouvert → crée un onglet vierge
+    info = _http("/json/new?url=about:blank", method="PUT")
+    return info, True
+
+
+def attach(page):
+    return Tab(page["webSocketDebuggerUrl"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JS helpers (injectés dans la page)
+# ─────────────────────────────────────────────────────────────────────────────
+# Snapshot : numérote les éléments interactifs visibles, injecte data-nb-ref pour clic ultérieur.
+JS_SNAPSHOT = r"""
+(() => {
+  const sel = 'a,button,input,textarea,select,[role=button],[role=link],[role=tab],[role=menuitem],[onclick],summary,[contenteditable=true]';
+  const els = Array.from(document.querySelectorAll(sel));
+  const out = [];
+  let i = 0;
+  for (const el of els) {
+    const r = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    const visible = r.width > 1 && r.height > 1 && style.visibility !== 'hidden' && style.display !== 'none' && r.bottom > 0 && r.top < (window.innerHeight + 600);
+    if (!visible) continue;
+    let name = (el.getAttribute('aria-label') || el.placeholder || el.value || el.innerText || el.getAttribute('title') || el.alt || '').trim().replace(/\s+/g,' ').slice(0,90);
+    if (!name && el.tagName === 'INPUT') name = '(' + (el.type||'text') + ')';
+    if (!name) continue;
+    el.setAttribute('data-nb-ref', i);
+    out.push({ref:i, tag:el.tagName.toLowerCase(), type:(el.type||el.getAttribute('role')||''), name:name,
+               href:(el.getAttribute('href')||'').slice(0,120),
+               x:Math.round(r.x+r.width/2), y:Math.round(r.y+r.height/2)});
+    i++;
+    if (i >= 150) break;
+  }
+  return JSON.stringify({url:location.href, title:document.title, count:out.length, elements:out});
+})()
+"""
+
+JS_READ = r"""
+(() => {
+  const t = (document.body ? document.body.innerText : '') || '';
+  return JSON.stringify({url:location.href, title:document.title, text:t.replace(/\n{3,}/g,'\n\n').trim()});
+})()
+"""
+
+JS_LINKS = r"""
+(() => {
+  const a = Array.from(document.querySelectorAll('a[href]')).slice(0,200).map(x => ({
+     text:(x.innerText||'').trim().replace(/\s+/g,' ').slice(0,80), href:x.href}))
+     .filter(l => l.text || l.href);
+  return JSON.stringify(a);
+})()
+"""
+
+# Clic par texte (technique SPA canonique : querySelectorAll + textContent.includes)
+def _js_click_text(text):
+    t = json.dumps(text)
+    return r"""
+(() => {
+  const needle = %s.toLowerCase();
+  const els = Array.from(document.querySelectorAll('a,button,[role=button],[role=link],[role=tab],[role=menuitem],input[type=submit],input[type=button],summary,div,span,li'));
+  for (const el of els) {
+    const txt = (el.innerText||el.value||el.getAttribute('aria-label')||'').trim().toLowerCase();
+    const r = el.getBoundingClientRect();
+    if (!txt || r.width < 1 || r.height < 1) continue;
+    if (txt.includes(needle)) {
+      el.scrollIntoView({block:'center'});
+      el.click();
+      return JSON.stringify({clicked:true, on:(el.innerText||el.value||'').trim().slice(0,80)});
+    }
+  }
+  return JSON.stringify({clicked:false});
+})()""" % t
+
+
+def _js_click_selector(selector):
+    s = json.dumps(selector)
+    return r"""
+(() => {
+  const el = document.querySelector(%s);
+  if (!el) return JSON.stringify({clicked:false, reason:'not found'});
+  el.scrollIntoView({block:'center'}); el.click();
+  return JSON.stringify({clicked:true, on:(el.innerText||el.value||'').trim().slice(0,80)});
+})()""" % s
+
+
+def _js_click_ref(ref):
+    return r"""
+(() => {
+  const el = document.querySelector('[data-nb-ref="%d"]');
+  if (!el) return JSON.stringify({clicked:false, reason:'ref absente (re-snapshot ?)'});
+  el.scrollIntoView({block:'center'}); el.click();
+  return JSON.stringify({clicked:true, on:(el.innerText||el.value||'').trim().slice(0,80)});
+})()""" % ref
+
+
+def _js_focus(selector=None, ref=None):
+    if ref is not None:
+        target = '[data-nb-ref="%d"]' % ref
+    else:
+        target = json.dumps(selector)[1:-1]
+    return r"""
+(() => {
+  const el = document.querySelector("%s");
+  if (!el) return JSON.stringify({ok:false});
+  el.focus(); el.scrollIntoView({block:'center'});
+  return JSON.stringify({ok:true});
+})()""" % target
+
+
+# React-safe fill : setter natif + dispatch input/change
+def _js_fill(selector, value):
+    s = json.dumps(selector)
+    v = json.dumps(value)
+    return r"""
+(() => {
+  const el = document.querySelector(%s);
+  if (!el) return JSON.stringify({ok:false, reason:'not found'});
+  const proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+  el.focus(); setter.call(el, %s);
+  el.dispatchEvent(new Event('input', {bubbles:true}));
+  el.dispatchEvent(new Event('change', {bubbles:true}));
+  return JSON.stringify({ok:true});
+})()""" % (s, v)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gemini Vision (fallback SPA/WebGL : Flow, Stitch, canvas) — pool de clés, rotation 429/403/5xx
+# ─────────────────────────────────────────────────────────────────────────────
+def _gemini_keys():
+    keys = []
+    env = os.environ.get("GEMINI_API_KEY")
+    if env:
+        keys.append(env)
+    for p in [os.path.expanduser("~/.config/dreamnova/gemini_keys.txt"),
+              os.path.expanduser("~/.config/dreamnova/gemini.key")]:
+        try:
+            with open(p) as f:
+                for line in f:
+                    k = line.strip()
+                    if k and k.startswith("AIza") and k not in keys:
+                        keys.append(k)
+        except Exception:
+            pass
+    return keys
+
+
+def gemini_vision(image_path, prompt, want_json=False):
+    keys = _gemini_keys()
+    if not keys:
+        return {"ok": False, "error": "aucune clé Gemini (voir ~/.config/dreamnova/gemini_keys.txt)"}
+    with open(image_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
+    body = {"contents": [{"parts": [
+        {"text": prompt},
+        {"inline_data": {"mime_type": "image/png", "data": b64}},
+    ]}]}
+    if want_json:
+        body["generationConfig"] = {"response_mime_type": "application/json"}
+    data = json.dumps(body).encode()
+    last = None
+    for k in keys:
+        url = ("https://generativelanguage.googleapis.com/v1beta/models/"
+               "gemini-2.5-flash:generateContent?key=" + k)
+        try:
+            req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+            r = json.loads(urllib.request.urlopen(req, timeout=60).read())
+            txt = r["candidates"][0]["content"]["parts"][0]["text"]
+            return {"ok": True, "answer": txt}
+        except urllib.error.HTTPError as e:
+            last = f"HTTP {e.code}"
+            if e.code in (429, 403, 500, 502, 503):
+                continue
+            return {"ok": False, "error": last}
+        except Exception as e:
+            last = str(e)
+            continue
+    return {"ok": False, "error": "toutes les clés Gemini ont échoué: " + str(last)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Verbs
+# ─────────────────────────────────────────────────────────────────────────────
+def v_status(a):
+    ver = ensure_chrome()
+    pages = list_pages()
+    return {"ok": bool(ver), "browser": ver, "cdp": CDP, "tabs": len(pages),
+            "current_tab": _read_current(), "profile": PROFILE}
+
+
+def v_tabs(a):
+    ensure_chrome()
+    pages = list_pages()
+    out = [{"id": p.get("id"), "title": (p.get("title") or "")[:70], "url": (p.get("url") or "")[:120]}
+           for p in pages]
+    if getattr(a, "select", None):
+        for p in pages:
+            if p.get("id") == a.select:
+                _write_current(a.select)
+    return {"ok": True, "count": len(out), "tabs": out, "current_tab": _read_current()}
+
+
+def v_goto(a):
+    ensure_chrome()
+    host = None
+    if a.reuse:
+        host = urllib.parse.urlparse(a.url).netloc or a.url
+    page, created = resolve_target(tab_id=a.tab, host=host, want_new=not a.reuse, url=a.url)
+    t = attach(page)
+    try:
+        if not created or (created and not page.get("url", "").startswith("http")):
+            t.navigate(a.url, wait=a.wait)
+        else:
+            time.sleep(a.wait)
+        _write_current(page["id"])
+        res = {"ok": True, "tab": page["id"], "created": created,
+               "url": t.eval("location.href"), "title": t.eval("document.title")}
+    finally:
+        t.close_ws()
+        hide()
+    return res
+
+
+def v_read(a):
+    page, _ = resolve_target(tab_id=a.tab)
+    t = attach(page)
+    try:
+        _write_current(page["id"])
+        raw = t.eval(JS_READ)
+        d = json.loads(raw) if isinstance(raw, str) and raw.startswith("{") else {"text": str(raw)}
+        text = (d.get("text") or "")[: a.max]
+        res = {"ok": True, "tab": page["id"], "url": d.get("url"), "title": d.get("title"),
+               "chars": len(text), "text": text}
+        if a.links:
+            lraw = t.eval(JS_LINKS)
+            res["links"] = json.loads(lraw) if isinstance(lraw, str) else []
+    finally:
+        t.close_ws()
+        hide()
+    return res
+
+
+def v_snapshot(a):
+    page, _ = resolve_target(tab_id=a.tab)
+    t = attach(page)
+    try:
+        _write_current(page["id"])
+        raw = t.eval(JS_SNAPSHOT)
+        d = json.loads(raw) if isinstance(raw, str) and raw.startswith("{") else {"elements": [], "count": 0}
+        d["ok"] = True
+        d["tab"] = page["id"]
+    finally:
+        t.close_ws()
+        hide()
+    return d
+
+
+def v_click(a):
+    page, _ = resolve_target(tab_id=a.tab)
+    t = attach(page)
+    try:
+        _write_current(page["id"])
+        if a.ref is not None:
+            raw = t.eval(_js_click_ref(a.ref))
+        elif a.text:
+            raw = t.eval(_js_click_text(a.text))
+        elif a.selector:
+            raw = t.eval(_js_click_selector(a.selector))
+        elif a.xy:
+            x, y = [int(v) for v in a.xy.split(",")]
+            t.click_xy(x, y)
+            raw = json.dumps({"clicked": True, "on": f"xy {x},{y}"})
+        else:
+            return {"ok": False, "error": "préciser --ref / --text / --selector / --xy"}
+        time.sleep(a.wait)
+        d = json.loads(raw) if isinstance(raw, str) else {"clicked": False}
+        d["ok"] = bool(d.get("clicked"))
+        d["tab"] = page["id"]
+        if not d["ok"]:
+            d["hint"] = "élément introuvable — re-snapshot, ou essaie --text / Gemini `act`. 2 échecs = STOP."
+    finally:
+        t.close_ws()
+        hide()
+    return d
+
+
+def v_type(a):
+    page, _ = resolve_target(tab_id=a.tab)
+    t = attach(page)
+    try:
+        _write_current(page["id"])
+        if a.ref is not None or a.selector:
+            fr = t.eval(_js_focus(selector=a.selector, ref=a.ref))
+            if isinstance(fr, str) and '"ok":false' in fr.replace(" ", ""):
+                return {"ok": False, "error": "cible à focus introuvable", "tab": page["id"]}
+        t.type_text(a.text)
+        time.sleep(a.wait)
+        res = {"ok": True, "tab": page["id"], "typed": len(a.text)}
+    finally:
+        t.close_ws()
+        hide()
+    return res
+
+
+def v_fill(a):
+    page, _ = resolve_target(tab_id=a.tab)
+    t = attach(page)
+    try:
+        _write_current(page["id"])
+        raw = t.eval(_js_fill(a.selector, a.value))
+        d = json.loads(raw) if isinstance(raw, str) else {"ok": False}
+        d["tab"] = page["id"]
+        if not d.get("ok"):
+            d["hint"] = "selector introuvable. 2 échecs = STOP."
+    finally:
+        t.close_ws()
+        hide()
+    return d
+
+
+KEYMAP = {
+    "Enter": ("Enter", "Enter", 13, "\r"), "Tab": ("Tab", "Tab", 9, "\t"),
+    "Escape": ("Escape", "Escape", 27, None), "Backspace": ("Backspace", "Backspace", 8, None),
+    "ArrowDown": ("ArrowDown", "ArrowDown", 40, None), "ArrowUp": ("ArrowUp", "ArrowUp", 38, None),
+    "ArrowLeft": ("ArrowLeft", "ArrowLeft", 37, None), "ArrowRight": ("ArrowRight", "ArrowRight", 39, None),
+    "Space": (" ", "Space", 32, " "),
+}
+
+
+def v_key(a):
+    page, _ = resolve_target(tab_id=a.tab)
+    t = attach(page)
+    try:
+        _write_current(page["id"])
+        spec = KEYMAP.get(a.name)
+        if not spec:
+            return {"ok": False, "error": f"touche inconnue '{a.name}'. Dispo: {list(KEYMAP)}"}
+        key, code, vk, text = spec
+        t.press_key(key, code, vk, text)
+        time.sleep(a.wait)
+        res = {"ok": True, "tab": page["id"], "key": a.name}
+    finally:
+        t.close_ws()
+        hide()
+    return res
+
+
+def v_eval(a):
+    page, _ = resolve_target(tab_id=a.tab)
+    t = attach(page)
+    try:
+        _write_current(page["id"])
+        val = t.eval(a.expr)
+        res = {"ok": True, "tab": page["id"], "value": val}
+    finally:
+        t.close_ws()
+        hide()
+    return res
+
+
+def v_screenshot(a):
+    page, _ = resolve_target(tab_id=a.tab)
+    out = a.out or os.path.join(STATE_DIR, "shot.png")
+    t = attach(page)
+    try:
+        _write_current(page["id"])
+        t.screenshot(out)
+        res = {"ok": True, "tab": page["id"], "path": out, "bytes": os.path.getsize(out)}
+    finally:
+        t.close_ws()
+        hide()
+    return res
+
+
+def v_see(a):
+    page, _ = resolve_target(tab_id=a.tab)
+    shot = os.path.join(STATE_DIR, "see.png")
+    t = attach(page)
+    try:
+        _write_current(page["id"])
+        t.screenshot(shot)
+    finally:
+        t.close_ws()
+        hide()
+    prompt = a.ask or "Décris précisément ce qui est affiché à l'écran : état, messages d'erreur/succès, éléments cliquables visibles."
+    g = gemini_vision(shot, prompt)
+    g["tab"] = page["id"]
+    g["screenshot"] = shot
+    return g
+
+
+def v_act(a):
+    page, _ = resolve_target(tab_id=a.tab)
+    shot = os.path.join(STATE_DIR, "act.png")
+    t = attach(page)
+    try:
+        _write_current(page["id"])
+        t.screenshot(shot)
+        size = t.eval("JSON.stringify({w:window.innerWidth,h:window.innerHeight})")
+        dims = json.loads(size) if isinstance(size, str) else {"w": 0, "h": 0}
+    finally:
+        t.close_ws()
+        hide()
+    prompt = (f"L'image fait {dims.get('w')}x{dims.get('h')} px (viewport). "
+              f"Tâche : {a.instruction}. "
+              "Renvoie UNIQUEMENT du JSON {\"x\":<pixel>,\"y\":<pixel>,\"found\":true,\"label\":\"<élément>\"} "
+              "donnant le centre exact de l'élément à cliquer. Si rien ne correspond, {\"found\":false}.")
+    g = gemini_vision(shot, prompt, want_json=True)
+    if not g.get("ok"):
+        return g
+    try:
+        coords = json.loads(g["answer"])
+    except Exception:
+        return {"ok": False, "error": "Gemini n'a pas renvoyé de coords JSON", "raw": g.get("answer")}
+    if not coords.get("found"):
+        return {"ok": False, "found": False, "hint": "Gemini ne voit pas la cible. 2 échecs = STOP."}
+    page2, _ = resolve_target(tab_id=page["id"])
+    t2 = attach(page2)
+    try:
+        t2.click_xy(int(coords["x"]), int(coords["y"]))
+        time.sleep(a.wait)
+    finally:
+        t2.close_ws()
+        hide()
+    return {"ok": True, "tab": page["id"], "clicked_xy": [coords.get("x"), coords.get("y")],
+            "label": coords.get("label")}
+
+
+def v_wait(a):
+    page, _ = resolve_target(tab_id=a.tab)
+    deadline = time.time() + a.ms / 1000.0
+    t = attach(page)
+    try:
+        _write_current(page["id"])
+        while time.time() < deadline:
+            if a.text:
+                hit = t.eval("document.body && document.body.innerText.includes(%s)" % json.dumps(a.text))
+                if hit is True:
+                    return {"ok": True, "tab": page["id"], "matched": "text"}
+            elif a.selector:
+                hit = t.eval("!!document.querySelector(%s)" % json.dumps(a.selector))
+                if hit is True:
+                    return {"ok": True, "tab": page["id"], "matched": "selector"}
+            else:
+                time.sleep(a.ms / 1000.0)
+                return {"ok": True, "tab": page["id"], "matched": "delay"}
+            time.sleep(0.4)
+        return {"ok": False, "tab": page["id"], "error": "timeout", "hint": "condition jamais remplie"}
+    finally:
+        t.close_ws()
+        hide()
+
+
+def v_close(a):
+    if not a.tab:
+        return {"ok": False, "error": "--tab <id> requis (ne ferme jamais WA/LI par erreur)"}
+    try:
+        # /json/close/<id> renvoie du TEXTE brut ("Target is closing"), pas du JSON → urlopen direct.
+        urllib.request.urlopen(CDP + "/json/close/" + a.tab, timeout=5).read()
+        if _read_current() == a.tab:
+            _write_current("")
+        return {"ok": True, "closed": a.tab}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def v_find(a):
+    """Suis-je authentifié sur ce domaine ? Délègue au script canonique si présent, sinon heuristique cookies."""
+    script = os.path.expanduser("~/etz-chaim/scripts/cdp_cookie_inspect.py")
+    if os.path.exists(script):
+        r = subprocess.run([sys.executable, script, a.domain], capture_output=True, text=True, timeout=30)
+        return {"ok": r.returncode == 0, "domain": a.domain, "exit": r.returncode,
+                "out": (r.stdout or r.stderr).strip()[:500]}
+    # fallback : compte les cookies du profil pour ce domaine
+    found = 0
+    for db in glob.glob(os.path.join(PROFILE, "*", "Cookies")) + [os.path.join(PROFILE, "Default", "Cookies")]:
+        if os.path.exists(db):
+            try:
+                import sqlite3
+                con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+                found += con.execute("SELECT COUNT(*) FROM cookies WHERE host_key LIKE ?",
+                                     ("%" + a.domain + "%",)).fetchone()[0]
+                con.close()
+            except Exception:
+                pass
+    return {"ok": found > 0, "domain": a.domain, "cookies": found,
+            "hint": "0 cookie → demander à David d'ouvrir Chrome Beta une fois sur ce site, ou dn-secret"}
+
+
+def v_upload(a):
+    page, _ = resolve_target(tab_id=a.tab)
+    t = attach(page)
+    try:
+        _write_current(page["id"])
+        ok = t.set_file_input(a.files, a.selector)
+        res = {"ok": bool(ok), "tab": page["id"], "files": a.files,
+               "hint": None if ok else "input[type=file] introuvable avec ce selector"}
+    finally:
+        t.close_ws()
+        hide()
+    return res
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
+def build_parser():
+    p = argparse.ArgumentParser(prog="nova-browse", description="Contrôleur navigateur headless universel (CDP Chrome Beta).")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def common(sp):
+        # --tab et --pretty sur CHAQUE sous-commande (forme naturelle : nova-browse <verbe> --tab X --pretty)
+        sp.add_argument("--tab", help="id d'onglet cible (sinon onglet courant mémorisé)")
+        sp.add_argument("--pretty", action="store_true", help="sortie lisible au lieu de JSON")
+        return sp
+
+    common(sub.add_parser("status")).set_defaults(fn=v_status)
+
+    sp = common(sub.add_parser("tabs")); sp.add_argument("--select"); sp.set_defaults(fn=v_tabs)
+
+    sp = common(sub.add_parser("goto")); sp.add_argument("url"); sp.add_argument("--reuse", action="store_true")
+    sp.add_argument("--wait", type=float, default=3.5); sp.set_defaults(fn=v_goto)
+
+    sp = common(sub.add_parser("read")); sp.add_argument("--links", action="store_true")
+    sp.add_argument("--max", type=int, default=4000); sp.set_defaults(fn=v_read)
+
+    common(sub.add_parser("snapshot")).set_defaults(fn=v_snapshot)
+
+    sp = common(sub.add_parser("click")); sp.add_argument("--ref", type=int); sp.add_argument("--text")
+    sp.add_argument("--selector"); sp.add_argument("--xy"); sp.add_argument("--wait", type=float, default=1.0)
+    sp.set_defaults(fn=v_click)
+
+    sp = common(sub.add_parser("type")); sp.add_argument("text"); sp.add_argument("--ref", type=int)
+    sp.add_argument("--selector"); sp.add_argument("--wait", type=float, default=0.3); sp.set_defaults(fn=v_type)
+
+    sp = common(sub.add_parser("fill")); sp.add_argument("--selector", required=True); sp.add_argument("value")
+    sp.set_defaults(fn=v_fill)
+
+    sp = common(sub.add_parser("key")); sp.add_argument("name"); sp.add_argument("--wait", type=float, default=0.5)
+    sp.set_defaults(fn=v_key)
+
+    sp = common(sub.add_parser("eval")); sp.add_argument("expr"); sp.set_defaults(fn=v_eval)
+
+    sp = common(sub.add_parser("screenshot")); sp.add_argument("out", nargs="?"); sp.set_defaults(fn=v_screenshot)
+
+    sp = common(sub.add_parser("see")); sp.add_argument("--ask"); sp.set_defaults(fn=v_see)
+
+    sp = common(sub.add_parser("act")); sp.add_argument("instruction"); sp.add_argument("--wait", type=float, default=1.5)
+    sp.set_defaults(fn=v_act)
+
+    sp = common(sub.add_parser("wait")); sp.add_argument("--text"); sp.add_argument("--selector")
+    sp.add_argument("--ms", type=int, default=10000); sp.set_defaults(fn=v_wait)
+
+    common(sub.add_parser("close")).set_defaults(fn=v_close)
+
+    sp = common(sub.add_parser("find")); sp.add_argument("domain"); sp.set_defaults(fn=v_find)
+
+    sp = common(sub.add_parser("upload")); sp.add_argument("files", nargs="+")
+    sp.add_argument("--selector", default="input[type=file]"); sp.set_defaults(fn=v_upload)
+
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    try:
+        result = args.fn(args)
+    except Exception as e:
+        result = {"ok": False, "error": str(e), "type": type(e).__name__,
+                  "hint": "Chrome Beta down ? `nova-browse status`. CDP=127.0.0.1:9222. 2 échecs = STOP → DAVID_ACTION_REQUIRED."}
+    if args.pretty:
+        if result.get("ok"):
+            for k, v in result.items():
+                if k == "ok":
+                    continue
+                if isinstance(v, (list, dict)):
+                    print(f"{k}: {json.dumps(v, ensure_ascii=False)[:2000]}")
+                else:
+                    print(f"{k}: {v}")
+        else:
+            print("ERREUR:", result.get("error"), "|", result.get("hint", ""))
+    else:
+        print(json.dumps(result, ensure_ascii=False))
+    sys.exit(0 if result.get("ok") else 1)
+
+
+if __name__ == "__main__":
+    main()
